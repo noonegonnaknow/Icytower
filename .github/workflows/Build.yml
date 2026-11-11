@@ -179,7 +179,7 @@ jobs:
                       while (acc >= step) { update(step); acc -= step }
                       val c = holder.lockCanvas()
                       if (c == null) { Thread.sleep(10); continue }
-                      try { draw(c) } finally { holder.unlockCanvasAndPost(c) }
+                      try { render(c) } finally { holder.unlockCanvasAndPost(c) }
                       Thread.sleep(4)
                   }
               }
@@ -192,7 +192,7 @@ jobs:
                   if (dir != 0) vx += dir * 1500f * dt
                   else {
                       val f = 900f * dt
-                      vx = if (abs(vx) <= f) 0f else vx - Math.signum(vx) * f
+                      vx = if (abs(vx) <= f) 0f else vx - kotlin.math.sign(vx) * f
                   }
                   vx = vx.coerceIn(-430f, 430f)
 
@@ -244,7 +244,7 @@ jobs:
                   }
               }
 
-              private fun draw(c: Canvas) {
+              private fun render(c: Canvas) {
                   c.drawColor(Color.rgb(20, 28, 60))
                   c.save()
                   c.scale(scale, scale)
