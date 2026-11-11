@@ -1,0 +1,421 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Create project
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "IcyTower"
+          include(":app")
+          EOF_FILE
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=false
+          org.gradle.jvmargs=-Xmx2g
+          EOF_FILE
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.icytower"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.icytower"
+                  minSdk = 21
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Icy Tower"
+                  android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/icytower/MainActivity.kt)
+          cat > app/src/main/java/com/example/icytower/MainActivity.kt <<'EOF_FILE'
+          package com.example.icytower
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.view.WindowManager
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  setContentView(GameView(this))
+              }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/icytower/GameView.kt)
+          cat > app/src/main/java/com/example/icytower/GameView.kt <<'EOF_FILE'
+          package com.example.icytower
+
+          import android.content.Context
+          import android.graphics.*
+          import android.media.AudioManager
+          import android.media.ToneGenerator
+          import android.view.MotionEvent
+          import android.view.SurfaceHolder
+          import android.view.SurfaceView
+          import kotlin.math.abs
+          import kotlin.math.floor
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sin
+
+          class GameView(ctx: Context) : SurfaceView(ctx), SurfaceHolder.Callback, Runnable {
+
+              private class Plat(val n: Int, val x: Float, val y: Float, val w: Float)
+
+              private val W = 480f
+              private var H = 800f
+              private var sc = 1f
+              private val WALL = 36f
+              private val GAP = 100f
+              private val pw = 30f
+
+              private val plats = ArrayList<Plat>()
+              private var px = 0f; private var py = 0f
+              private var vx = 0f; private var vy = 0f
+              private var face = 1
+              private var camY = 0f; private var groundY = 0f
+              private var nextN = 1
+              private var lastFloor = 0
+              private var base = 0; private var bonus = 0
+              private var combo = 0; private var comboTimer = 0f; private var comboText = ""
+              private var scrolling = false
+              @Volatile private var state = 0      // 0 меню, 1 игра, 2 конец
+              @Volatile private var req = 0        // 1 в меню, 2 начать игру
+              private var deadTimer = 0f
+              private var animT = 0f
+              private var best = 0
+              @Volatile private var goL = false
+              @Volatile private var goR = false
+
+              private val prefs = ctx.getSharedPreferences("icy", Context.MODE_PRIVATE)
+              private var tone: ToneGenerator? = null
+              private var thread: Thread? = null
+              @Volatile private var running = false
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val rect = RectF()
+              private val pal = intArrayOf(
+                  Color.rgb(120, 220, 255), Color.rgb(255, 120, 190), Color.rgb(130, 230, 120),
+                  Color.rgb(255, 190, 80), Color.rgb(190, 140, 255)
+              )
+
+              init {
+                  holder.addCallback(this)
+                  paint.typeface = Typeface.DEFAULT_BOLD
+                  best = prefs.getInt("best", 0)
+                  tone = try { ToneGenerator(AudioManager.STREAM_MUSIC, 70) } catch (e: Exception) { null }
+              }
+
+              override fun surfaceCreated(h: SurfaceHolder) {
+                  running = true
+                  thread = Thread(this).also { it.start() }
+              }
+
+              override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {
+                  sc = w / W
+                  H = hh / sc
+                  req = 1
+              }
+
+              override fun surfaceDestroyed(h: SurfaceHolder) {
+                  running = false
+                  thread?.join()
+              }
+
+              private fun reset() {
+                  plats.clear()
+                  groundY = H - 60f
+                  plats.add(Plat(0, 0f, groundY, W))
+                  nextN = 1; lastFloor = 0; base = 0; bonus = 0
+                  combo = 0; comboTimer = 0f; scrolling = false
+                  px = W / 2 - pw / 2; py = groundY
+                  vx = 0f; vy = -720f
+                  camY = 0f
+              }
+
+              override fun run() {
+                  var last = System.nanoTime()
+                  var acc = 0f
+                  val step = 1f / 60f
+                  while (running) {
+                      if (req != 0) {
+                          val r = req; req = 0
+                          reset(); state = if (r == 2) 1 else 0
+                      }
+                      val now = System.nanoTime()
+                      acc += (now - last) / 1e9f
+                      last = now
+                      if (acc > 0.1f) acc = 0.1f
+                      while (acc >= step) { update(step); acc -= step }
+                      val c = holder.lockCanvas()
+                      if (c == null) { Thread.sleep(10); continue }
+                      try { render(c) } finally { holder.unlockCanvasAndPost(c) }
+                      Thread.sleep(4)
+                  }
+              }
+
+              private fun update(dt: Float) {
+                  if (state == 2) { deadTimer += dt; return }
+                  if (state != 1) return
+                  animT += dt
+                  if (comboTimer > 0f) comboTimer -= dt
+
+                  // управление: полуэкраны, быстрый разворот
+                  val dir = (if (goR) 1 else 0) - (if (goL) 1 else 0)
+                  if (dir != 0) {
+                      face = dir
+                      val a = if (vx * dir < 0f) 5000f else 2600f
+                      vx += dir * a * dt
+                  } else {
+                      val f = 900f * dt
+                      vx = if (abs(vx) <= f) 0f else vx - kotlin.math.sign(vx) * f
+                  }
+                  vx = vx.coerceIn(-330f, 330f)
+
+                  vy += 1800f * dt
+                  val prev = py
+                  px += vx * dt
+                  py += vy * dt
+
+                  if (px < WALL) { px = WALL; vx = abs(vx) * 0.8f }
+                  if (px > W - WALL - pw) { px = W - WALL - pw; vx = -abs(vx) * 0.8f }
+
+                  if (vy >= 0f) {
+                      for (p in plats) {
+                          if (prev <= p.y && py >= p.y && px + pw > p.x && px < p.x + p.w) { land(p); break }
+                      }
+                  }
+
+                  val fl = base / 10
+                  if (fl >= 3) scrolling = true
+                  val tgt = py - H * 0.4f
+                  if (tgt < camY) camY = tgt
+                  if (scrolling) camY -= (20f + min(fl * 0.5f, 90f)) * dt
+
+                  while (groundY - nextN * GAP > camY - 300f) {
+                      val w = max(70f, 130f - nextN * 0.4f)
+                      val x = WALL + Math.random().toFloat() * (W - 2 * WALL - w)
+                      plats.add(Plat(nextN, x, groundY - nextN * GAP, w))
+                      nextN++
+                  }
+                  plats.removeAll { it.y > camY + H + 100f }
+
+                  if (py - camY > H + 40f) {
+                      state = 2; deadTimer = 0f
+                      if (base + bonus > best) { best = base + bonus; prefs.edit().putInt("best", best).apply() }
+                      tone?.startTone(ToneGenerator.TONE_PROP_NACK, 200)
+                  }
+              }
+
+              private fun land(p: Plat) {
+                  py = p.y
+                  val j = p.n - lastFloor
+                  if (j >= 2) {
+                      combo++
+                      val b = combo * j * 10
+                      bonus += b
+                      comboTimer = 1.6f
+                      comboText = "КОМБО x$combo  +$b"
+                      tone?.startTone(ToneGenerator.TONE_PROP_ACK, 80)
+                  } else combo = 0
+                  lastFloor = p.n
+                  base = max(base, p.n * 10)
+                  vy = -(720f + abs(vx) * 0.6f)   // авто-прыжок: чем быстрее, тем выше
+              }
+
+              private fun txt(c: Canvas, s: String, x: Float, y: Float, size: Float, col: Int,
+                              al: Paint.Align = Paint.Align.LEFT) {
+                  paint.textSize = size; paint.textAlign = al
+                  paint.color = Color.argb(160, 0, 0, 0); c.drawText(s, x + 2f, y + 2f, paint)
+                  paint.color = col; c.drawText(s, x, y, paint)
+              }
+
+              private fun render(c: Canvas) {
+                  val sw = width.toFloat(); val sh = height.toFloat()
+                  val fl = base / 10
+                  val hue = (210f + fl * 3f) % 360f
+                  paint.shader = LinearGradient(0f, 0f, 0f, sh,
+                      Color.HSVToColor(floatArrayOf(hue, 0.55f, 0.65f)),
+                      Color.HSVToColor(floatArrayOf((hue + 50f) % 360f, 0.7f, 0.25f)), Shader.TileMode.CLAMP)
+                  paint.style = Paint.Style.FILL
+                  c.drawRect(0f, 0f, sw, sh, paint)
+                  paint.shader = null
+
+                  c.save(); c.scale(sc, sc); c.translate(0f, -camY)
+                  walls(c); platforms(c); player(c)
+                  c.restore()
+
+                  val m = WALL * sc + 14f
+                  if (state == 1) {
+                      txt(c, "Очки: ${base + bonus}", m, 70f, 46f, Color.WHITE)
+                      txt(c, "Этаж: $lastFloor   Рекорд: $best", m, 108f, 30f, Color.rgb(255, 230, 120))
+                      if (comboTimer > 0f) txt(c, comboText, sw / 2, sh * 0.25f, 56f, Color.rgb(255, 220, 40), Paint.Align.CENTER)
+                      paint.color = Color.argb(70, 255, 255, 255)
+                      txt(c, "◀", sw * 0.12f, sh - 40f, 70f, Color.argb(90, 255, 255, 255), Paint.Align.CENTER)
+                      txt(c, "▶", sw * 0.88f, sh - 40f, 70f, Color.argb(90, 255, 255, 255), Paint.Align.CENTER)
+                  } else {
+                      paint.color = Color.argb(150, 0, 0, 0)
+                      c.drawRect(0f, 0f, sw, sh, paint)
+                      if (state == 0) {
+                          txt(c, "ICY TOWER", sw / 2, sh * 0.30f, 110f, Color.rgb(120, 230, 255), Paint.Align.CENTER)
+                          txt(c, "Тапни, чтобы начать", sw / 2, sh * 0.45f, 52f, Color.WHITE, Paint.Align.CENTER)
+                          txt(c, "Левая половина экрана — влево", sw / 2, sh * 0.55f, 36f, Color.rgb(255, 230, 120), Paint.Align.CENTER)
+                          txt(c, "Правая — вправо. Прыгает сам!", sw / 2, sh * 0.60f, 36f, Color.rgb(255, 230, 120), Paint.Align.CENTER)
+                          txt(c, "Рекорд: $best", sw / 2, sh * 0.70f, 44f, Color.WHITE, Paint.Align.CENTER)
+                      } else {
+                          txt(c, "ИГРА ОКОНЧЕНА", sw / 2, sh * 0.35f, 80f, Color.rgb(255, 110, 110), Paint.Align.CENTER)
+                          txt(c, "Этаж: $lastFloor", sw / 2, sh * 0.45f, 50f, Color.WHITE, Paint.Align.CENTER)
+                          txt(c, "Очки: ${base + bonus}", sw / 2, sh * 0.51f, 50f, Color.WHITE, Paint.Align.CENTER)
+                          txt(c, "Рекорд: $best", sw / 2, sh * 0.57f, 44f, Color.rgb(255, 230, 120), Paint.Align.CENTER)
+                          if (deadTimer > 0.6f) txt(c, "Тапни, чтобы ещё раз", sw / 2, sh * 0.68f, 46f, Color.WHITE, Paint.Align.CENTER)
+                      }
+                  }
+              }
+
+              private fun walls(c: Canvas) {
+                  val rh = 24f
+                  val r0 = floor(camY / rh).toInt()
+                  val r1 = r0 + (H / rh).toInt() + 2
+                  for (r in r0..r1) {
+                      val y = r * rh
+                      paint.color = if (r % 2 == 0) Color.rgb(150, 72, 60) else Color.rgb(172, 90, 70)
+                      c.drawRect(0f, y, WALL, y + rh, paint); c.drawRect(W - WALL, y, W, y + rh, paint)
+                      paint.color = Color.rgb(90, 40, 35)
+                      c.drawRect(0f, y, WALL, y + 2f, paint); c.drawRect(W - WALL, y, W, y + 2f, paint)
+                      val jx = if (r % 2 == 0) 12f else 24f
+                      c.drawRect(jx, y, jx + 2f, y + rh, paint)
+                      c.drawRect(W - WALL + jx, y, W - WALL + jx + 2f, y + rh, paint)
+                  }
+                  paint.color = Color.argb(70, 0, 0, 0)
+                  c.drawRect(WALL, camY, WALL + 6f, camY + H, paint)
+                  c.drawRect(W - WALL - 6f, camY, W - WALL, camY + H, paint)
+              }
+
+              private fun platforms(c: Canvas) {
+                  for (p in plats) {
+                      if (p.n == 0) {
+                          paint.color = Color.rgb(110, 70, 50); c.drawRect(0f, p.y, W, p.y + 60f, paint)
+                          paint.color = Color.rgb(120, 230, 120); c.drawRect(0f, p.y, W, p.y + 8f, paint)
+                          continue
+                      }
+                      paint.color = pal[(p.n / 10) % pal.size]
+                      rect.set(p.x, p.y, p.x + p.w, p.y + 16f); c.drawRoundRect(rect, 6f, 6f, paint)
+                      paint.color = Color.argb(150, 255, 255, 255)
+                      c.drawRect(p.x + 4f, p.y + 2f, p.x + p.w - 4f, p.y + 5f, paint)
+                      paint.color = Color.argb(80, 0, 0, 0)
+                      c.drawRect(p.x + 2f, p.y + 12f, p.x + p.w - 2f, p.y + 16f, paint)
+                      if (p.n % 10 == 0) txt(c, "${p.n}", p.x + p.w / 2, p.y - 8f, 30f, Color.YELLOW, Paint.Align.CENTER)
+                      else { paint.textSize = 12f; paint.textAlign = Paint.Align.CENTER
+                          paint.color = Color.argb(170, 20, 30, 60); c.drawText("${p.n}", p.x + p.w / 2, p.y + 13f, paint) }
+                  }
+              }
+
+              private fun r(c: Canvas, x1: Float, y1: Float, x2: Float, y2: Float, col: Int) {
+                  paint.color = col; c.drawRect(x1, y1, x2, y2, paint)
+              }
+
+              private fun player(c: Canvas) {
+                  val x = px; val y = py
+                  val moving = abs(vx) > 40f
+                  val s = if (moving) sin(animT * 20f) * 4f else 0f
+                  val tuck = if (vy < 0f) -3f else 0f
+                  val navy = Color.rgb(40, 60, 150)
+                  r(c, x + 5f, y - 12f + tuck + s, x + 13f, y + tuck + s, navy)
+                  r(c, x + 17f, y - 12f + tuck - s, x + 25f, y + tuck - s, navy)
+                  r(c, x + 3f, y - 28f, x + 27f, y - 12f, Color.rgb(235, 70, 40))
+                  val skin = Color.rgb(255, 210, 170)
+                  val up = if (vy < 0f) -6f else 0f
+                  r(c, x - 2f, y - 27f + up, x + 3f, y - 17f + up, skin)
+                  r(c, x + 27f, y - 27f + up, x + 32f, y - 17f + up, skin)
+                  val yel = Color.rgb(255, 210, 40)
+                  r(c, x + 3f, y - 31f, x + 27f, y - 27f, yel)
+                  val fl = sin(animT * 15f) * 2f
+                  if (face > 0) r(c, x - 8f, y - 30f + fl, x + 3f, y - 26f + fl, yel)
+                  else r(c, x + 27f, y - 30f + fl, x + 38f, y - 26f + fl, yel)
+                  r(c, x + 6f, y - 42f, x + 24f, y - 31f, skin)
+                  r(c, x + 4f, y - 47f, x + 26f, y - 39f, Color.rgb(60, 120, 255))
+                  paint.color = Color.WHITE; c.drawCircle(x + 15f, y - 50f, 4f, paint)
+                  r(c, x + 9f, y - 38f, x + 14f, y - 33f, Color.WHITE)
+                  r(c, x + 16f, y - 38f, x + 21f, y - 33f, Color.WHITE)
+                  val o = face * 1.5f
+                  r(c, x + 10.5f + o, y - 37f, x + 12.5f + o, y - 34f, Color.BLACK)
+                  r(c, x + 17.5f + o, y - 37f, x + 19.5f + o, y - 34f, Color.BLACK)
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val a = e.actionMasked
+                  if (state != 1) {
+                      if (a == MotionEvent.ACTION_DOWN && (state == 0 || deadTimer > 0.6f)) req = 2
+                      return true
+                  }
+                  var l = false; var rr = false
+                  if (a != MotionEvent.ACTION_UP && a != MotionEvent.ACTION_CANCEL) {
+                      val skip = if (a == MotionEvent.ACTION_POINTER_UP) e.actionIndex else -1
+                      for (i in 0 until e.pointerCount) {
+                          if (i == skip) continue
+                          if (e.getX(i) < width / 2f) l = true else rr = true
+                      }
+                  }
+                  goL = l; goR = rr
+                  return true
+              }
+          }
+          EOF_FILE
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IcyTower-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
